@@ -2,34 +2,36 @@ import React, { useState, useEffect } from 'react';
 import {
     View,
     Text,
-    TextInput,
     TouchableOpacity,
     ScrollView,
     StyleSheet,
     Alert,
-    KeyboardAvoidingView,
-    Platform,
 } from 'react-native';
 import SignalingService from '../services/SignalingService';
 import WebRTCService from '../services/WebRTCService';
+import ClipboardService from '../services/ClipboardService';
+import BackgroundService from '../services/BackgroundService';
 import { generateRoomCode } from '../utils/helpers';
 
 const HostScreen = ({ navigation }) => {
     const [roomCode, setRoomCode] = useState('');
     const [status, setStatus] = useState('Initializing...');
-    const [messages, setMessages] = useState([]);
-    const [inputMessage, setInputMessage] = useState('');
     const [connectedPeers, setConnectedPeers] = useState(0);
     const [totalPeers, setTotalPeers] = useState(0);
+    const [lastClipboard, setLastClipboard] = useState('');
+    const [clipboardHistory, setClipboardHistory] = useState([]);
     const [signalingService] = useState(new SignalingService());
     const [webrtcService] = useState(new WebRTCService(signalingService));
+    const [clipboardService] = useState(new ClipboardService(webrtcService));
 
     useEffect(() => {
         initializeHost();
 
         return () => {
+            clipboardService.stopMonitoring();
             webrtcService.close();
             signalingService.close();
+            BackgroundService.stop();
         };
     }, []);
 
@@ -55,9 +57,23 @@ const HostScreen = ({ navigation }) => {
                 setStatus(peers.length > 0 ? `Connected to ${peers.length} peer(s)` : 'Waiting for peers...');
             });
 
-            // Setup message handler
-            webrtcService.onMessage((message, fromPeer) => {
-                setMessages((prev) => [...prev, { text: message, sender: 'peer', fromPeer }]);
+            // Setup clipboard message handler
+            webrtcService.onMessage((data, fromPeer) => {
+                try {
+                    const parsed = JSON.parse(data);
+                    if (parsed.type === 'clipboard') {
+                        clipboardService.handleClipboard(parsed);
+                    }
+                } catch (e) {
+                    // Not JSON
+                }
+            });
+
+            // Setup clipboard change callback
+            clipboardService.onClipboardChange((content) => {
+                const preview = content.length > 100 ? content.substring(0, 100) + '...' : content;
+                setLastClipboard(preview);
+                setClipboardHistory(prev => [{ content: preview, time: new Date() }, ...prev.slice(0, 9)]);
             });
 
             // Setup peer count handler
@@ -66,8 +82,13 @@ const HostScreen = ({ navigation }) => {
                 setTotalPeers(total);
                 if (connected === 0) {
                     setStatus('Waiting for peers...');
+                    clipboardService.stopMonitoring();
+                    BackgroundService.stop();
                 } else if (connected === total) {
-                    setStatus(`Connected to ${connected} peer(s)`);
+                    setStatus(`Clipboard sync active with ${connected} peer(s)`);
+                    // Start clipboard monitoring when connected
+                    clipboardService.startMonitoring();
+                    BackgroundService.start();
                 } else {
                     setStatus(`Connecting... (${connected}/${total})`);
                 }
@@ -80,23 +101,8 @@ const HostScreen = ({ navigation }) => {
         }
     };
 
-    const sendMessage = () => {
-        if (!inputMessage.trim()) return;
-
-        const sent = webrtcService.broadcastMessage(inputMessage);
-        if (sent) {
-            setMessages((prev) => [...prev, { text: inputMessage, sender: 'you' }]);
-            setInputMessage('');
-        } else {
-            Alert.alert('Error', 'No peers connected');
-        }
-    };
-
     return (
-        <KeyboardAvoidingView
-            style={styles.container}
-            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        >
+        <View style={styles.container}>
             <View style={styles.header}>
                 <TouchableOpacity
                     style={styles.backButton}
@@ -115,52 +121,50 @@ const HostScreen = ({ navigation }) => {
                     {connectedPeers} / {totalPeers} peers connected
                 </Text>
                 <Text style={styles.hint}>
-                    Share this code with others to connect
+                    Share this code with others to sync clipboards
                 </Text>
             </View>
 
-            <View style={styles.chatContainer}>
-                <Text style={styles.chatTitle}>Messages</Text>
-                <ScrollView style={styles.messageList}>
-                    {messages.length === 0 ? (
-                        <Text style={styles.emptyText}>No messages yet</Text>
-                    ) : (
-                        messages.map((msg, index) => (
-                            <View
-                                key={index}
-                                style={[
-                                    styles.message,
-                                    msg.sender === 'you' ? styles.myMessage : styles.peerMessage,
-                                ]}
-                            >
-                                <Text style={styles.messageSender}>
-                                    {msg.sender === 'you' ? 'You' : 'Peer'}
-                                </Text>
-                                <Text style={styles.messageText}>{msg.text}</Text>
-                            </View>
-                        ))
-                    )}
-                </ScrollView>
+            <View style={styles.clipboardContainer}>
+                <Text style={styles.clipboardTitle}>📋 Clipboard Sync</Text>
 
-                <View style={styles.inputContainer}>
-                    <TextInput
-                        style={styles.input}
-                        value={inputMessage}
-                        onChangeText={setInputMessage}
-                        placeholder="Type a message..."
-                        placeholderTextColor="#666"
-                        editable={connectedPeers > 0}
-                    />
-                    <TouchableOpacity
-                        style={[styles.sendButton, connectedPeers === 0 && styles.sendButtonDisabled]}
-                        onPress={sendMessage}
-                        disabled={connectedPeers === 0}
-                    >
-                        <Text style={styles.sendButtonText}>Send</Text>
-                    </TouchableOpacity>
-                </View>
+                {connectedPeers === 0 ? (
+                    <View style={styles.emptyState}>
+                        <Text style={styles.emptyText}>Waiting for devices to connect...</Text>
+                        <Text style={styles.emptySubtext}>Clipboard sync will start automatically</Text>
+                    </View>
+                ) : (
+                    <>
+                        {lastClipboard ? (
+                            <View style={styles.lastClipboardCard}>
+                                <Text style={styles.lastClipboardLabel}>Last Synced:</Text>
+                                <Text style={styles.lastClipboardText}>{lastClipboard}</Text>
+                            </View>
+                        ) : (
+                            <View style={styles.emptyState}>
+                                <Text style={styles.emptyText}>Copy something to sync!</Text>
+                            </View>
+                        )}
+
+                        {clipboardHistory.length > 0 && (
+                            <View style={styles.historySection}>
+                                <Text style={styles.historyTitle}>Recent History</Text>
+                                <ScrollView style={styles.historyList}>
+                                    {clipboardHistory.map((item, index) => (
+                                        <View key={index} style={styles.historyItem}>
+                                            <Text style={styles.historyText}>{item.content}</Text>
+                                            <Text style={styles.historyTime}>
+                                                {item.time.toLocaleTimeString()}
+                                            </Text>
+                                        </View>
+                                    ))}
+                                </ScrollView>
+                            </View>
+                        )}
+                    </>
+                )}
             </View>
-        </KeyboardAvoidingView>
+        </View>
     );
 };
 
@@ -222,7 +226,7 @@ const styles = StyleSheet.create({
         fontSize: 12,
         color: '#666',
     },
-    chatContainer: {
+    clipboardContainer: {
         flex: 1,
         backgroundColor: '#1a1a1a',
         margin: 20,
@@ -230,70 +234,71 @@ const styles = StyleSheet.create({
         borderRadius: 12,
         padding: 15,
     },
-    chatTitle: {
-        fontSize: 18,
+    clipboardTitle: {
+        fontSize: 20,
         fontWeight: 'bold',
         color: '#fff',
-        marginBottom: 10,
+        marginBottom: 15,
     },
-    messageList: {
+    emptyState: {
         flex: 1,
-        marginBottom: 10,
+        justifyContent: 'center',
+        alignItems: 'center',
     },
     emptyText: {
         color: '#666',
-        textAlign: 'center',
-        marginTop: 20,
+        fontSize: 16,
+        marginBottom: 8,
     },
-    message: {
+    emptySubtext: {
+        color: '#444',
+        fontSize: 14,
+    },
+    lastClipboardCard: {
+        backgroundColor: '#0a0a0a',
+        padding: 15,
+        borderRadius: 8,
+        borderWidth: 1,
+        borderColor: '#333',
+        marginBottom: 15,
+    },
+    lastClipboardLabel: {
+        fontSize: 12,
+        color: '#888',
+        marginBottom: 8,
+    },
+    lastClipboardText: {
+        fontSize: 14,
+        color: '#fff',
+        lineHeight: 20,
+    },
+    historySection: {
+        flex: 1,
+    },
+    historyTitle: {
+        fontSize: 14,
+        color: '#888',
+        marginBottom: 10,
+    },
+    historyList: {
+        flex: 1,
+    },
+    historyItem: {
+        backgroundColor: '#0a0a0a',
         padding: 12,
         borderRadius: 8,
         marginBottom: 8,
-        maxWidth: '80%',
+        borderWidth: 1,
+        borderColor: '#222',
     },
-    myMessage: {
-        backgroundColor: '#6366f1',
-        alignSelf: 'flex-end',
-    },
-    peerMessage: {
-        backgroundColor: '#333',
-        alignSelf: 'flex-start',
-    },
-    messageSender: {
-        fontSize: 10,
-        color: 'rgba(255, 255, 255, 0.6)',
+    historyText: {
+        fontSize: 13,
+        color: '#ccc',
         marginBottom: 4,
     },
-    messageText: {
-        fontSize: 14,
-        color: '#fff',
-    },
-    inputContainer: {
-        flexDirection: 'row',
-        gap: 10,
-    },
-    input: {
-        flex: 1,
-        backgroundColor: '#0a0a0a',
-        borderWidth: 1,
-        borderColor: '#333',
-        borderRadius: 8,
-        padding: 12,
-        color: '#fff',
-        fontSize: 14,
-    },
-    sendButton: {
-        backgroundColor: '#6366f1',
-        paddingHorizontal: 20,
-        borderRadius: 8,
-        justifyContent: 'center',
-    },
-    sendButtonDisabled: {
-        backgroundColor: '#333',
-    },
-    sendButtonText: {
-        color: '#fff',
-        fontWeight: 'bold',
+    historyTime: {
+        fontSize: 11,
+        color: '#666',
     },
 });
 

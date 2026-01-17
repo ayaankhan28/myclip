@@ -1,15 +1,15 @@
 
 """
-Simple WebRTC Chat with 6-Digit Code - Only 2 Terminals Needed!
+WebRTC Clipboard Sync - Multi-Device Mesh Network
 
 Installation:
-pip install aiortc aiohttp
+pip install aiortc aiohttp pyperclip
 
 Usage:
-Terminal 1: python chat.py --host
-Terminal 2: python chat.py --join
+Terminal 1: python main.py --host
+Terminal 2: python main.py --join
 
-The host creates a 6-digit code, the joiner enters it!
+Clipboard is automatically synced across all connected devices!
 """
 
 import asyncio
@@ -19,6 +19,8 @@ import argparse
 import aiohttp
 from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
+import pyperclip
+import hashlib
 
 
 # ============= SIGNALING SERVER (runs in host mode) =============
@@ -131,10 +133,63 @@ class WebRTCChat:
         self.peer_connections = {}  # {peer_id: {'pc': RTCPeerConnection, 'channel': DataChannel}}
         self.ws = None
         self.my_peer_id = None
+        self.last_clipboard_hash = None
+        self.clipboard_monitor_task = None
         
+    def get_clipboard_hash(self, text):
+        """Generate MD5 hash of clipboard content"""
+        return hashlib.md5(text.encode('utf-8')).hexdigest()
+    
+    async def start_clipboard_monitor(self):
+        """Monitor clipboard for changes and broadcast to peers"""
+        print("[Clipboard] Monitoring started...")
+        while True:
+            try:
+                current = pyperclip.paste()
+                if current:
+                    current_hash = self.get_clipboard_hash(current)
+                    
+                    if current_hash != self.last_clipboard_hash:
+                        self.last_clipboard_hash = current_hash
+                        preview = current[:50] + "..." if len(current) > 50 else current
+                        print(f"\n[Clipboard] Syncing: {preview}")
+                        self.broadcast_clipboard(current, current_hash)
+                
+                await asyncio.sleep(0.5)  # Check every 500ms
+            except Exception as e:
+                print(f"\n[Clipboard Error]: {e}")
+                await asyncio.sleep(1)
+    
+    def broadcast_clipboard(self, content, content_hash):
+        """Send clipboard content to all peers"""
+        message = json.dumps({
+            'type': 'clipboard',
+            'content': content,
+            'hash': content_hash
+        })
+        sent_count = self.broadcast_message(message)
+        if sent_count:
+            print(f"[Clipboard] Sent to {sent_count} peer(s)")
+    
     def on_message(self, message, from_peer):
-        print(f"\n[Peer {from_peer[:8]}...]: {message}")
-        print(">> ", end='', flush=True)
+        """Handle received messages (clipboard data)"""
+        try:
+            data = json.loads(message)
+            if data['type'] == 'clipboard':
+                content = data['content']
+                content_hash = data['hash']
+                
+                if content_hash != self.last_clipboard_hash:
+                    self.last_clipboard_hash = content_hash
+                    pyperclip.copy(content)
+                    preview = content[:50] + "..." if len(content) > 50 else content
+                    print(f"\n[Clipboard] Received from {from_peer[:8]}...: {preview}")
+        except json.JSONDecodeError:
+            # Not JSON, treat as regular chat message
+            print(f"\n[Peer {from_peer[:8]}...]: {message}")
+            print(">> ", end='', flush=True)
+        except Exception as e:
+            print(f"\n[Clipboard Error]: {e}")
     
     async def connect_signaling(self, room_code, server_url='http://localhost:8080'):
         session = aiohttp.ClientSession()
@@ -199,10 +254,24 @@ class WebRTCChat:
                     from_peer = data.get('fromPeer')
                     if from_peer in self.peer_connections and data.get('candidate'):
                         cand_data = data['candidate']
-                        # aiortc RTCIceCandidate only needs candidate string
-                        candidate = cand_data['candidate']
-                        pc = self.peer_connections[from_peer]['pc']
-                        await pc.addIceCandidate(candidate)
+                        candidate_str = cand_data.get('candidate')
+                        sdp_mid = cand_data.get('sdpMid')
+                        sdp_mline_index = cand_data.get('sdpMLineIndex')
+                        
+                        # Parse the candidate string to create RTCIceCandidate
+                        # We need to handle the "candidate:" prefix if present
+                        if candidate_str:
+                            parts = candidate_str.split()
+                            # Basic parsing relying on standard candidate format
+                            # candidate:foundation component protocol priority ip port typ type ...
+                            if len(parts) >= 8:
+                                from aiortc.sdp import candidate_from_sdp
+                                candidate = candidate_from_sdp(candidate_str)
+                                candidate.sdpMid = sdp_mid
+                                candidate.sdpMLineIndex = sdp_mline_index
+                                
+                                pc = self.peer_connections[from_peer]['pc']
+                                await pc.addIceCandidate(candidate)
                 
                 elif data['type'] == 'peer_left':
                     peer_id = data.get('peerId')
@@ -339,18 +408,15 @@ async def run_host():
     
     await asyncio.sleep(1)
     
+    # Start clipboard monitoring
+    chat.clipboard_monitor_task = asyncio.create_task(chat.start_clipboard_monitor())
+    
+    print("\n[Clipboard sync active. Press Ctrl+C to quit]\n")
+    
     try:
+        # Keep running until interrupted
         while True:
-            message = await asyncio.get_event_loop().run_in_executor(None, input, ">> ")
-            
-            if message.lower() == 'quit':
-                break
-            
-            if message.strip():
-                if chat.broadcast_message(message):
-                    print(f"[You → {chat.get_connected_count()} peer(s)]: {message}")
-                else:
-                    print("[Waiting for connections...]")
+            await asyncio.sleep(1)
     finally:
         await chat.close()
         await session.close()
@@ -374,18 +440,15 @@ async def run_join():
     
     await asyncio.sleep(1)
     
+    # Start clipboard monitoring
+    chat.clipboard_monitor_task = asyncio.create_task(chat.start_clipboard_monitor())
+    
+    print("\n[Clipboard sync active. Press Ctrl+C to quit]\n")
+    
     try:
+        # Keep running until interrupted
         while True:
-            message = await asyncio.get_event_loop().run_in_executor(None, input, ">> ")
-            
-            if message.lower() == 'quit':
-                break
-            
-            if message.strip():
-                if chat.broadcast_message(message):
-                    print(f"[You → {chat.get_connected_count()} peer(s)]: {message}")
-                else:
-                    print("[Waiting for connections...]")
+            await asyncio.sleep(1)
     finally:
         await chat.close()
         await session.close()

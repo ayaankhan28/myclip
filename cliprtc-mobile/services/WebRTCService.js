@@ -138,11 +138,16 @@ class WebRTCService {
      */
     setupSignalingHandlers() {
         // Handle new peer joined
+        // Handle new peer joined
         this.signalingService.on('peer_joined', async (data) => {
             const { peerId } = data;
             console.log(`[WebRTC] New peer joined: ${peerId}`);
-            // Don't create connection yet, wait for their offer
-            // (they will initiate since they joined after us)
+
+            // Check who should initiate
+            const shouldInitiate = this.myPeerId < peerId;
+            console.log(`[WebRTC] ${shouldInitiate ? 'Initiating' : 'Waiting for'} connection with ${peerId}`);
+
+            await this.createPeerConnection(peerId, shouldInitiate);
         });
 
         // Handle offer
