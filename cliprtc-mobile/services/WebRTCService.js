@@ -1,4 +1,4 @@
-// WebRTC service for peer-to-peer connection
+// WebRTC service for multi-peer mesh network connections
 import {
     RTCPeerConnection,
     RTCIceCandidate,
@@ -8,11 +8,10 @@ import {
 class WebRTCService {
     constructor(signalingService) {
         this.signalingService = signalingService;
-        this.peerConnection = null;
-        this.dataChannel = null;
-        this.isInitiator = false;
+        this.peerConnections = new Map(); // Map<peerId, {pc, dataChannel}>
+        this.myPeerId = null;
         this.onMessageCallback = null;
-        this.onConnectionStateCallback = null;
+        this.onPeerCountCallback = null;
 
         // ICE servers configuration
         this.configuration = {
@@ -24,20 +23,49 @@ class WebRTCService {
     }
 
     /**
-     * Initialize WebRTC peer connection
+     * Initialize WebRTC service with peer ID
      */
-    async initialize(isInitiator = false) {
-        this.isInitiator = isInitiator;
+    async initialize(myPeerId, existingPeers = []) {
+        this.myPeerId = myPeerId;
+        console.log(`[WebRTC] Initialized with peer ID: ${myPeerId}`);
+        console.log(`[WebRTC] Existing peers:`, existingPeers);
 
-        // Create peer connection
-        this.peerConnection = new RTCPeerConnection(this.configuration);
+        // Setup signaling handlers
+        this.setupSignalingHandlers();
+
+        // Create connections to all existing peers
+        for (const peerId of existingPeers) {
+            // Use peer ID comparison to determine who initiates
+            // Lower peer ID initiates the connection
+            const shouldInitiate = myPeerId < peerId;
+            console.log(`[WebRTC] ${shouldInitiate ? 'Initiating' : 'Waiting for'} connection with ${peerId}`);
+            await this.createPeerConnection(peerId, shouldInitiate);
+        }
+
+        this.updatePeerCount();
+    }
+
+    /**
+     * Create a peer connection for a specific peer
+     */
+    async createPeerConnection(peerId, isInitiator) {
+        if (this.peerConnections.has(peerId)) {
+            console.log(`[WebRTC] Connection to ${peerId} already exists`);
+            return;
+        }
+
+        console.log(`[WebRTC] Creating connection to peer ${peerId} (initiator: ${isInitiator})`);
+
+        const pc = new RTCPeerConnection(this.configuration);
+        const peerInfo = { pc, dataChannel: null, isInitiator };
 
         // Handle ICE candidates
-        this.peerConnection.onicecandidate = (event) => {
+        pc.onicecandidate = (event) => {
             if (event.candidate) {
-                console.log('[WebRTC] Sending ICE candidate');
+                console.log(`[WebRTC] Sending ICE candidate to ${peerId}`);
                 this.signalingService.send({
                     type: 'ice',
+                    targetPeer: peerId,
                     candidate: {
                         candidate: event.candidate.candidate,
                         sdpMid: event.candidate.sdpMid,
@@ -48,59 +76,60 @@ class WebRTCService {
         };
 
         // Handle connection state changes
-        this.peerConnection.onconnectionstatechange = () => {
-            const state = this.peerConnection.connectionState;
-            console.log('[WebRTC] Connection state:', state);
-            if (this.onConnectionStateCallback) {
-                this.onConnectionStateCallback(state);
+        pc.onconnectionstatechange = () => {
+            const state = pc.connectionState;
+            console.log(`[WebRTC] Connection to ${peerId} state:`, state);
+
+            if (state === 'connected') {
+                console.log(`[WebRTC] ✓ Connected to peer ${peerId}`);
+                this.updatePeerCount();
+            } else if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+                console.log(`[WebRTC] ✗ Disconnected from peer ${peerId}`);
+                this.removePeer(peerId);
             }
         };
 
         // If initiator, create data channel
         if (isInitiator) {
-            this.createDataChannel();
+            const dataChannel = pc.createDataChannel('chat');
+            peerInfo.dataChannel = dataChannel;
+            this.setupDataChannel(peerId, dataChannel);
+            console.log(`[WebRTC] Data channel created for ${peerId}`);
         } else {
             // If not initiator, wait for data channel
-            this.peerConnection.ondatachannel = (event) => {
-                console.log('[WebRTC] Data channel received');
-                this.dataChannel = event.channel;
-                this.setupDataChannel();
+            pc.ondatachannel = (event) => {
+                console.log(`[WebRTC] Data channel received from ${peerId}`);
+                peerInfo.dataChannel = event.channel;
+                this.setupDataChannel(peerId, event.channel);
             };
         }
 
-        // Setup signaling handlers
-        this.setupSignalingHandlers();
-    }
+        this.peerConnections.set(peerId, peerInfo);
 
-    /**
-     * Create data channel (initiator only)
-     */
-    createDataChannel() {
-        this.dataChannel = this.peerConnection.createDataChannel('chat');
-        this.setupDataChannel();
-        console.log('[WebRTC] Data channel created');
+        // If initiator, create and send offer
+        if (isInitiator) {
+            await this.createOffer(peerId);
+        }
     }
 
     /**
      * Setup data channel event handlers
      */
-    setupDataChannel() {
-        this.dataChannel.onopen = () => {
-            console.log('[WebRTC] Data channel opened');
-            if (this.onConnectionStateCallback) {
-                this.onConnectionStateCallback('connected');
-            }
+    setupDataChannel(peerId, dataChannel) {
+        dataChannel.onopen = () => {
+            console.log(`[WebRTC] Data channel opened with ${peerId}`);
+            this.updatePeerCount();
         };
 
-        this.dataChannel.onmessage = (event) => {
-            console.log('[WebRTC] Message received:', event.data);
+        dataChannel.onmessage = (event) => {
+            console.log(`[WebRTC] Message from ${peerId}:`, event.data);
             if (this.onMessageCallback) {
-                this.onMessageCallback(event.data);
+                this.onMessageCallback(event.data, peerId);
             }
         };
 
-        this.dataChannel.onclose = () => {
-            console.log('[WebRTC] Data channel closed');
+        dataChannel.onclose = () => {
+            console.log(`[WebRTC] Data channel closed with ${peerId}`);
         };
     }
 
@@ -108,107 +137,169 @@ class WebRTCService {
      * Setup signaling message handlers
      */
     setupSignalingHandlers() {
-        // Handle peer joined
-        this.signalingService.on('peer_joined', async () => {
-            if (this.isInitiator) {
-                console.log('[WebRTC] Peer joined, creating offer');
-                await this.createOffer();
-            }
+        // Handle new peer joined
+        this.signalingService.on('peer_joined', async (data) => {
+            const { peerId } = data;
+            console.log(`[WebRTC] New peer joined: ${peerId}`);
+            // Don't create connection yet, wait for their offer
+            // (they will initiate since they joined after us)
         });
 
         // Handle offer
         this.signalingService.on('offer', async (data) => {
-            console.log('[WebRTC] Received offer');
-            await this.handleOffer(data.sdp);
+            const { fromPeer, sdp } = data;
+            console.log(`[WebRTC] Received offer from ${fromPeer}`);
+
+            // Create peer connection if it doesn't exist
+            if (!this.peerConnections.has(fromPeer)) {
+                await this.createPeerConnection(fromPeer, false);
+            }
+
+            await this.handleOffer(fromPeer, sdp);
         });
 
         // Handle answer
         this.signalingService.on('answer', async (data) => {
-            console.log('[WebRTC] Received answer');
-            await this.handleAnswer(data.sdp);
+            const { fromPeer, sdp } = data;
+            console.log(`[WebRTC] Received answer from ${fromPeer}`);
+            await this.handleAnswer(fromPeer, sdp);
         });
 
         // Handle ICE candidate
         this.signalingService.on('ice', async (data) => {
-            if (data.candidate) {
-                console.log('[WebRTC] Received ICE candidate');
-                const candidate = new RTCIceCandidate({
-                    candidate: data.candidate.candidate,
-                    sdpMid: data.candidate.sdpMid,
-                    sdpMLineIndex: data.candidate.sdpMLineIndex,
+            const { fromPeer, candidate } = data;
+            if (candidate && this.peerConnections.has(fromPeer)) {
+                console.log(`[WebRTC] Received ICE candidate from ${fromPeer}`);
+                const peerInfo = this.peerConnections.get(fromPeer);
+                const iceCandidate = new RTCIceCandidate({
+                    candidate: candidate.candidate,
+                    sdpMid: candidate.sdpMid,
+                    sdpMLineIndex: candidate.sdpMLineIndex,
                 });
-                await this.peerConnection.addIceCandidate(candidate);
+                await peerInfo.pc.addIceCandidate(iceCandidate);
             }
+        });
+
+        // Handle peer left
+        this.signalingService.on('peer_left', (data) => {
+            const { peerId } = data;
+            console.log(`[WebRTC] Peer left: ${peerId}`);
+            this.removePeer(peerId);
         });
     }
 
     /**
-     * Create and send offer
+     * Create and send offer to a peer
      */
-    async createOffer() {
+    async createOffer(peerId) {
         try {
-            const offer = await this.peerConnection.createOffer();
-            await this.peerConnection.setLocalDescription(offer);
+            const peerInfo = this.peerConnections.get(peerId);
+            if (!peerInfo) return;
+
+            const offer = await peerInfo.pc.createOffer();
+            await peerInfo.pc.setLocalDescription(offer);
 
             this.signalingService.send({
                 type: 'offer',
+                targetPeer: peerId,
                 sdp: {
                     type: offer.type,
                     sdp: offer.sdp,
                 },
             });
         } catch (error) {
-            console.error('[WebRTC] Create offer error:', error);
+            console.error(`[WebRTC] Create offer error for ${peerId}:`, error);
         }
     }
 
     /**
-     * Handle received offer
+     * Handle received offer from a peer
      */
-    async handleOffer(sdp) {
+    async handleOffer(peerId, sdp) {
         try {
-            await this.peerConnection.setRemoteDescription(
-                new RTCSessionDescription(sdp)
-            );
+            const peerInfo = this.peerConnections.get(peerId);
+            if (!peerInfo) return;
 
-            const answer = await this.peerConnection.createAnswer();
-            await this.peerConnection.setLocalDescription(answer);
+            await peerInfo.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+
+            const answer = await peerInfo.pc.createAnswer();
+            await peerInfo.pc.setLocalDescription(answer);
 
             this.signalingService.send({
                 type: 'answer',
+                targetPeer: peerId,
                 sdp: {
                     type: answer.type,
                     sdp: answer.sdp,
                 },
             });
         } catch (error) {
-            console.error('[WebRTC] Handle offer error:', error);
+            console.error(`[WebRTC] Handle offer error from ${peerId}:`, error);
         }
     }
 
     /**
-     * Handle received answer
+     * Handle received answer from a peer
      */
-    async handleAnswer(sdp) {
+    async handleAnswer(peerId, sdp) {
         try {
-            await this.peerConnection.setRemoteDescription(
-                new RTCSessionDescription(sdp)
-            );
+            const peerInfo = this.peerConnections.get(peerId);
+            if (!peerInfo) return;
+
+            await peerInfo.pc.setRemoteDescription(new RTCSessionDescription(sdp));
         } catch (error) {
-            console.error('[WebRTC] Handle answer error:', error);
+            console.error(`[WebRTC] Handle answer error from ${peerId}:`, error);
         }
     }
 
     /**
-     * Send message through data channel
+     * Broadcast message to all connected peers
      */
-    sendMessage(message) {
-        if (this.dataChannel && this.dataChannel.readyState === 'open') {
-            this.dataChannel.send(message);
-            return true;
+    broadcastMessage(message) {
+        let sentCount = 0;
+
+        for (const [peerId, peerInfo] of this.peerConnections) {
+            if (peerInfo.dataChannel && peerInfo.dataChannel.readyState === 'open') {
+                peerInfo.dataChannel.send(message);
+                sentCount++;
+            }
         }
-        console.warn('[WebRTC] Data channel not ready');
-        return false;
+
+        console.log(`[WebRTC] Broadcast message to ${sentCount} peers`);
+        return sentCount > 0;
+    }
+
+    /**
+     * Remove a peer connection
+     */
+    removePeer(peerId) {
+        const peerInfo = this.peerConnections.get(peerId);
+        if (peerInfo) {
+            if (peerInfo.dataChannel) {
+                peerInfo.dataChannel.close();
+            }
+            if (peerInfo.pc) {
+                peerInfo.pc.close();
+            }
+            this.peerConnections.delete(peerId);
+            console.log(`[WebRTC] Removed peer ${peerId}`);
+            this.updatePeerCount();
+        }
+    }
+
+    /**
+     * Update peer count callback
+     */
+    updatePeerCount() {
+        const connectedCount = Array.from(this.peerConnections.values()).filter(
+            (info) => info.dataChannel && info.dataChannel.readyState === 'open'
+        ).length;
+
+        console.log(`[WebRTC] Connected peers: ${connectedCount}/${this.peerConnections.size}`);
+
+        if (this.onPeerCountCallback) {
+            this.onPeerCountCallback(connectedCount, this.peerConnections.size);
+        }
     }
 
     /**
@@ -219,22 +310,35 @@ class WebRTCService {
     }
 
     /**
-     * Set connection state callback
+     * Set peer count callback
      */
-    onConnectionState(callback) {
-        this.onConnectionStateCallback = callback;
+    onPeerCount(callback) {
+        this.onPeerCountCallback = callback;
     }
 
     /**
-     * Close connection
+     * Get connected peer count
+     */
+    getConnectedPeerCount() {
+        return Array.from(this.peerConnections.values()).filter(
+            (info) => info.dataChannel && info.dataChannel.readyState === 'open'
+        ).length;
+    }
+
+    /**
+     * Close all connections
      */
     close() {
-        if (this.dataChannel) {
-            this.dataChannel.close();
+        for (const [peerId, peerInfo] of this.peerConnections) {
+            if (peerInfo.dataChannel) {
+                peerInfo.dataChannel.close();
+            }
+            if (peerInfo.pc) {
+                peerInfo.pc.close();
+            }
         }
-        if (this.peerConnection) {
-            this.peerConnection.close();
-        }
+        this.peerConnections.clear();
+        console.log('[WebRTC] All connections closed');
     }
 }
 

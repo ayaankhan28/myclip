@@ -14,12 +14,16 @@ class SignalingService {
             try {
                 this.ws = new WebSocket(`${serverUrl}/ws`);
 
+                // Generate unique peer ID
+                this.peerId = `peer-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
                 this.ws.onopen = () => {
                     console.log('[Signaling] Connected to server');
-                    // Join room
+                    // Join room with peer ID
                     this.send({
                         type: 'join',
-                        code: roomCode
+                        code: roomCode,
+                        peerId: this.peerId
                     });
                     resolve();
                 };

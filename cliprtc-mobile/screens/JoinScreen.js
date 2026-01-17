@@ -12,7 +12,7 @@ import {
 } from 'react-native';
 import SignalingService from '../services/SignalingService';
 import WebRTCService from '../services/WebRTCService';
-import { isValidRoomCode, isValidIP } from '../utils/helpers';
+import { isValidRoomCode } from '../utils/helpers';
 
 const JoinScreen = ({ navigation }) => {
     const [hostIP, setHostIP] = useState('');
@@ -20,7 +20,8 @@ const JoinScreen = ({ navigation }) => {
     const [status, setStatus] = useState('Enter details to connect');
     const [messages, setMessages] = useState([]);
     const [inputMessage, setInputMessage] = useState('');
-    const [connected, setConnected] = useState(false);
+    const [connectedPeers, setConnectedPeers] = useState(0);
+    const [totalPeers, setTotalPeers] = useState(0);
     const [joining, setJoining] = useState(false);
     const [signalingService] = useState(new SignalingService());
     const [webrtcService] = useState(new WebRTCService(signalingService));
@@ -52,28 +53,36 @@ const JoinScreen = ({ navigation }) => {
             setStatus('Connecting to server...');
             await signalingService.connect(serverUrl, roomCode);
 
-            // Initialize WebRTC as non-initiator
-            await webrtcService.initialize(false);
+            // Setup signaling handler for joined event
+            signalingService.on('joined', async (data) => {
+                const { myId, peers, peerCount } = data;
+                console.log('[Join] Joined room. My ID:', myId, 'Existing peers:', peers);
 
-            // Setup message handler
-            webrtcService.onMessage((message) => {
-                setMessages((prev) => [...prev, { text: message, sender: 'peer' }]);
+                // Initialize WebRTC with our peer ID and existing peers
+                await webrtcService.initialize(myId, peers);
+
+                setTotalPeers(peerCount - 1); // Exclude self
+                setStatus(peers.length > 0 ? `Connected to ${peers.length} peer(s)` : 'Waiting for peers...');
             });
 
-            // Setup connection state handler
-            webrtcService.onConnectionState((state) => {
-                if (state === 'connected') {
-                    setStatus('Connected!');
-                    setConnected(true);
-                } else if (state === 'disconnected' || state === 'failed') {
-                    setStatus('Connection lost');
-                    setConnected(false);
+            // Setup message handler
+            webrtcService.onMessage((message, fromPeer) => {
+                setMessages((prev) => [...prev, { text: message, sender: 'peer', fromPeer }]);
+            });
+
+            // Setup peer count handler
+            webrtcService.onPeerCount((connected, total) => {
+                setConnectedPeers(connected);
+                setTotalPeers(total);
+                if (connected === 0) {
+                    setStatus('Waiting for peers...');
+                } else if (connected === total) {
+                    setStatus(`Connected to ${connected} peer(s)`);
                 } else {
-                    setStatus(`Status: ${state}`);
+                    setStatus(`Connecting... (${connected}/${total})`);
                 }
             });
 
-            setStatus('Waiting for connection...');
         } catch (error) {
             console.error('Join error:', error);
             Alert.alert('Error', 'Failed to connect. Make sure the host IP and code are correct.');
@@ -85,11 +94,12 @@ const JoinScreen = ({ navigation }) => {
     const sendMessage = () => {
         if (!inputMessage.trim()) return;
 
-        if (webrtcService.sendMessage(inputMessage)) {
+        const sent = webrtcService.broadcastMessage(inputMessage);
+        if (sent) {
             setMessages((prev) => [...prev, { text: inputMessage, sender: 'you' }]);
             setInputMessage('');
         } else {
-            Alert.alert('Error', 'Not connected yet');
+            Alert.alert('Error', 'No peers connected');
         }
     };
 
@@ -153,6 +163,9 @@ const JoinScreen = ({ navigation }) => {
                     <View style={styles.infoCard}>
                         <Text style={styles.connectedTo}>Connected to: {hostIP}</Text>
                         <Text style={styles.statusText}>{status}</Text>
+                        <Text style={styles.peerCount}>
+                            {connectedPeers} / {totalPeers} peers connected
+                        </Text>
                     </View>
 
                     <View style={styles.chatContainer}>
@@ -185,12 +198,12 @@ const JoinScreen = ({ navigation }) => {
                                 onChangeText={setInputMessage}
                                 placeholder="Type a message..."
                                 placeholderTextColor="#666"
-                                editable={connected}
+                                editable={connectedPeers > 0}
                             />
                             <TouchableOpacity
-                                style={[styles.sendButton, !connected && styles.sendButtonDisabled]}
+                                style={[styles.sendButton, connectedPeers === 0 && styles.sendButtonDisabled]}
                                 onPress={sendMessage}
-                                disabled={!connected}
+                                disabled={connectedPeers === 0}
                             >
                                 <Text style={styles.sendButtonText}>Send</Text>
                             </TouchableOpacity>
@@ -286,6 +299,11 @@ const styles = StyleSheet.create({
     statusText: {
         fontSize: 16,
         color: '#10b981',
+        marginBottom: 8,
+    },
+    peerCount: {
+        fontSize: 14,
+        color: '#888',
     },
     chatContainer: {
         flex: 1,

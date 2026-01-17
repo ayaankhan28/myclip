@@ -24,7 +24,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 # ============= SIGNALING SERVER (runs in host mode) =============
 class SignalingServer:
     def __init__(self):
-        self.rooms = {}
+        self.rooms = {}  # {room_code: {peer_id: websocket}}
         self.app = web.Application()
         self.app.router.add_get('/ws', self.websocket_handler)
         self.runner = None
@@ -57,6 +57,7 @@ class SignalingServer:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         room_code = None
+        peer_id = None
         
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
@@ -64,52 +65,87 @@ class SignalingServer:
                 
                 if data['type'] == 'join':
                     room_code = data['code']
-                    if room_code not in self.rooms:
-                        self.rooms[room_code] = []
-                    self.rooms[room_code].append(ws)
+                    peer_id = data.get('peerId', str(random.randint(100000, 999999)))
                     
+                    if room_code not in self.rooms:
+                        self.rooms[room_code] = {}
+                    
+                    # Get list of existing peers
+                    existing_peers = list(self.rooms[room_code].keys())
+                    
+                    # Add this peer to room
+                    self.rooms[room_code][peer_id] = ws
+                    
+                    # Send joined confirmation with peer list
                     await ws.send_str(json.dumps({
                         'type': 'joined',
                         'code': room_code,
-                        'peers': len(self.rooms[room_code])
+                        'myId': peer_id,
+                        'peers': existing_peers,  # List of peer IDs already in room
+                        'peerCount': len(self.rooms[room_code])
                     }))
                     
-                    for peer in self.rooms[room_code]:
-                        if peer != ws:
-                            await peer.send_str(json.dumps({'type': 'peer_joined'}))
+                    print(f"[Peer {peer_id} joined room {room_code}. Total peers: {len(self.rooms[room_code])}")
+                    
+                    # Notify all existing peers about new peer
+                    for existing_peer_id, existing_ws in self.rooms[room_code].items():
+                        if existing_peer_id != peer_id:
+                            await existing_ws.send_str(json.dumps({
+                                'type': 'peer_joined',
+                                'peerId': peer_id
+                            }))
                 
                 elif data['type'] in ['offer', 'answer', 'ice']:
-                    if room_code and room_code in self.rooms:
-                        for peer in self.rooms[room_code]:
-                            if peer != ws:
-                                await peer.send_str(msg.data)
+                    # Route message to specific peer
+                    target_peer_id = data.get('targetPeer')
+                    if room_code and room_code in self.rooms and target_peer_id in self.rooms[room_code]:
+                        target_ws = self.rooms[room_code][target_peer_id]
+                        # Add fromPeer to the message
+                        data['fromPeer'] = peer_id
+                        await target_ws.send_str(json.dumps(data))
         
-        if room_code and room_code in self.rooms:
-            self.rooms[room_code].remove(ws)
-            if not self.rooms[room_code]:
-                del self.rooms[room_code]
+        # Handle disconnection
+        if room_code and room_code in self.rooms and peer_id:
+            if peer_id in self.rooms[room_code]:
+                del self.rooms[room_code][peer_id]
+                print(f"[Peer {peer_id} left room {room_code}. Remaining peers: {len(self.rooms[room_code])}")
+                
+                # Notify remaining peers
+                for remaining_peer_id, remaining_ws in self.rooms[room_code].items():
+                    await remaining_ws.send_str(json.dumps({
+                        'type': 'peer_left',
+                        'peerId': peer_id
+                    }))
+                
+                # Clean up empty room
+                if not self.rooms[room_code]:
+                    del self.rooms[room_code]
         
         return ws
 
 
-# ============= WEBRTC CHAT CLIENT =============
+
+# ============= WEBRTC CHAT CLIENT (Multi-Peer Support) =============
 class WebRTCChat:
     def __init__(self):
-        self.pc = RTCPeerConnection()
-        self.channel = None
+        self.peer_connections = {}  # {peer_id: {'pc': RTCPeerConnection, 'channel': DataChannel}}
         self.ws = None
-        self.is_initiator = False
-        self.connected = False
+        self.my_peer_id = None
         
-    def on_message(self, message):
-        print(f"\n[Peer]: {message}")
+    def on_message(self, message, from_peer):
+        print(f"\n[Peer {from_peer[:8]}...]: {message}")
         print(">> ", end='', flush=True)
     
     async def connect_signaling(self, room_code, server_url='http://localhost:8080'):
         session = aiohttp.ClientSession()
         self.ws = await session.ws_connect(f'{server_url}/ws')
         
-        await self.ws.send_json({'type': 'join', 'code': room_code})
+        # Generate peer ID in same format as mobile app
+        import time
+        timestamp = int(time.time() * 1000)
+        random_str = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=9))
+        self.my_peer_id = f"peer-{timestamp}-{random_str}"
+        await self.ws.send_json({'type': 'join', 'code': room_code, 'peerId': self.my_peer_id})
         asyncio.create_task(self.handle_signaling())
         
         return session
@@ -120,40 +156,78 @@ class WebRTCChat:
                 data = json.loads(msg.data)
                 
                 if data['type'] == 'joined':
-                    if data['peers'] == 1:
-                        print("[Waiting for peer...]")
-                        self.is_initiator = True
+                    my_id = data.get('myId')
+                    existing_peers = data.get('peers', [])
+                    peer_count = data.get('peerCount', 1)
+                    
+                    print(f"[Joined room. My ID: {my_id[:8]}..., Peers: {len(existing_peers)}]")
+                    
+                    if len(existing_peers) == 0:
+                        print("[Waiting for peers...]")
                     else:
-                        print("[Peer found!]")
+                        print(f"[Found {len(existing_peers)} peer(s)!]")
+                        # Create connections to existing peers
+                        for peer_id in existing_peers:
+                            should_initiate = self.my_peer_id < peer_id
+                            if should_initiate:
+                                await self.create_peer_connection(peer_id, is_initiator=True)
                 
                 elif data['type'] == 'peer_joined':
-                    if self.is_initiator:
-                        await self.create_offer()
+                    peer_id = data.get('peerId')
+                    print(f"\n[Peer {peer_id[:8]}... joined]")
+                    print(">> ", end='', flush=True)
+                    
+                    # Use peer ID comparison to determine who initiates
+                    should_initiate = self.my_peer_id < peer_id
+                    if should_initiate:
+                        print(f"[Creating connection to {peer_id[:8]}...]")
+                        await self.create_peer_connection(peer_id, is_initiator=True)
+                    else:
+                        print(f"[Waiting for connection from {peer_id[:8]}...]")
                 
                 elif data['type'] == 'offer':
-                    await self.handle_offer(data['sdp'])
+                    from_peer = data.get('fromPeer')
+                    if from_peer not in self.peer_connections:
+                        await self.create_peer_connection(from_peer, is_initiator=False)
+                    await self.handle_offer(from_peer, data['sdp'])
                 
                 elif data['type'] == 'answer':
-                    await self.handle_answer(data['sdp'])
+                    from_peer = data.get('fromPeer')
+                    await self.handle_answer(from_peer, data['sdp'])
                 
                 elif data['type'] == 'ice':
-                    if data['candidate']:
-                        candidate = RTCIceCandidate(
-                            sdpMid=data['candidate']['sdpMid'],
-                            sdpMLineIndex=data['candidate']['sdpMLineIndex'],
-                            candidate=data['candidate']['candidate']
-                        )
-                        await self.pc.addIceCandidate(candidate)
+                    from_peer = data.get('fromPeer')
+                    if from_peer in self.peer_connections and data.get('candidate'):
+                        cand_data = data['candidate']
+                        # aiortc RTCIceCandidate only needs candidate string
+                        candidate = cand_data['candidate']
+                        pc = self.peer_connections[from_peer]['pc']
+                        await pc.addIceCandidate(candidate)
+                
+                elif data['type'] == 'peer_left':
+                    peer_id = data.get('peerId')
+                    print(f"\n[Peer {peer_id[:8]}... left]")
+                    print(">> ", end='', flush=True)
+                    if peer_id in self.peer_connections:
+                        await self.remove_peer(peer_id)
     
-    async def create_offer(self):
-        self.channel = self.pc.createDataChannel("chat")
-        self.setup_channel()
+    async def create_peer_connection(self, peer_id, is_initiator):
+        if peer_id in self.peer_connections:
+            return
         
-        @self.pc.on("icecandidate")
+        print(f"[Creating peer connection to {peer_id[:8]}... (initiator: {is_initiator})]")
+        
+        pc = RTCPeerConnection()
+        peer_info = {'pc': pc, 'channel': None}
+        self.peer_connections[peer_id] = peer_info
+        
+        # Handle ICE candidates
+        @pc.on("icecandidate")
         async def on_ice(event):
             if event.candidate:
                 await self.ws.send_json({
                     'type': 'ice',
+                    'targetPeer': peer_id,
                     'candidate': {
                         'candidate': event.candidate.candidate,
                         'sdpMid': event.candidate.sdpMid,
@@ -161,65 +235,89 @@ class WebRTCChat:
                     }
                 })
         
-        offer = await self.pc.createOffer()
-        await self.pc.setLocalDescription(offer)
-        
-        await self.ws.send_json({
-            'type': 'offer',
-            'sdp': {'type': self.pc.localDescription.type, 'sdp': self.pc.localDescription.sdp}
-        })
+        if is_initiator:
+            # Create data channel
+            channel = pc.createDataChannel("chat")
+            peer_info['channel'] = channel
+            self.setup_channel(peer_id, channel)
+            
+            # Create and send offer
+            offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+            
+            await self.ws.send_json({
+                'type': 'offer',
+                'targetPeer': peer_id,
+                'sdp': {'type': pc.localDescription.type, 'sdp': pc.localDescription.sdp}
+            })
+        else:
+            # Wait for data channel
+            @pc.on("datachannel")
+            def on_datachannel(channel):
+                peer_info['channel'] = channel
+                self.setup_channel(peer_id, channel)
     
-    async def handle_offer(self, sdp):
-        @self.pc.on("datachannel")
-        def on_datachannel(channel):
-            self.channel = channel
-            self.setup_channel()
+    async def handle_offer(self, from_peer, sdp):
+        pc = self.peer_connections[from_peer]['pc']
         
-        @self.pc.on("icecandidate")
-        async def on_ice(event):
-            if event.candidate:
-                await self.ws.send_json({
-                    'type': 'ice',
-                    'candidate': {
-                        'candidate': event.candidate.candidate,
-                        'sdpMid': event.candidate.sdpMid,
-                        'sdpMLineIndex': event.candidate.sdpMLineIndex
-                    }
-                })
-        
-        await self.pc.setRemoteDescription(RTCSessionDescription(sdp=sdp['sdp'], type=sdp['type']))
-        answer = await self.pc.createAnswer()
-        await self.pc.setLocalDescription(answer)
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp['sdp'], type=sdp['type']))
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
         
         await self.ws.send_json({
             'type': 'answer',
-            'sdp': {'type': self.pc.localDescription.type, 'sdp': self.pc.localDescription.sdp}
+            'targetPeer': from_peer,
+            'sdp': {'type': pc.localDescription.type, 'sdp': pc.localDescription.sdp}
         })
     
-    async def handle_answer(self, sdp):
-        await self.pc.setRemoteDescription(RTCSessionDescription(sdp=sdp['sdp'], type=sdp['type']))
+    async def handle_answer(self, from_peer, sdp):
+        pc = self.peer_connections[from_peer]['pc']
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp['sdp'], type=sdp['type']))
     
-    def setup_channel(self):
-        @self.channel.on("open")
+    def setup_channel(self, peer_id, channel):
+        @channel.on("open")
         def on_open():
-            self.connected = True
-            print("\n✓ Connected! You can now chat.\n")
+            print(f"\n✓ Connected to peer {peer_id[:8]}...!")
+            print(f"[Total connections: {self.get_connected_count()}]")
             print(">> ", end='', flush=True)
         
-        @self.channel.on("message")
+        @channel.on("message")
         def on_message(message):
-            self.on_message(message)
+            self.on_message(message, peer_id)
     
-    def send_message(self, message):
-        if self.channel and self.channel.readyState == "open":
-            self.channel.send(message)
-            return True
-        return False
+    def broadcast_message(self, message):
+        sent_count = 0
+        for peer_id, peer_info in self.peer_connections.items():
+            channel = peer_info['channel']
+            if channel and channel.readyState == "open":
+                channel.send(message)
+                sent_count += 1
+        return sent_count > 0
+    
+    def get_connected_count(self):
+        count = 0
+        for peer_info in self.peer_connections.values():
+            if peer_info['channel'] and peer_info['channel'].readyState == "open":
+                count += 1
+        return count
+    
+    async def remove_peer(self, peer_id):
+        if peer_id in self.peer_connections:
+            peer_info = self.peer_connections[peer_id]
+            if peer_info['channel']:
+                peer_info['channel'].close()
+            await peer_info['pc'].close()
+            del self.peer_connections[peer_id]
     
     async def close(self):
         if self.ws:
             await self.ws.close()
-        await self.pc.close()
+        for peer_info in self.peer_connections.values():
+            if peer_info['channel']:
+                peer_info['channel'].close()
+            await peer_info['pc'].close()
+        self.peer_connections.clear()
+
 
 
 # ============= MAIN APPLICATION =============
@@ -249,10 +347,10 @@ async def run_host():
                 break
             
             if message.strip():
-                if chat.send_message(message):
-                    print(f"[You]: {message}")
+                if chat.broadcast_message(message):
+                    print(f"[You → {chat.get_connected_count()} peer(s)]: {message}")
                 else:
-                    print("[Waiting for connection...]")
+                    print("[Waiting for connections...]")
     finally:
         await chat.close()
         await session.close()
@@ -284,10 +382,10 @@ async def run_join():
                 break
             
             if message.strip():
-                if chat.send_message(message):
-                    print(f"[You]: {message}")
+                if chat.broadcast_message(message):
+                    print(f"[You → {chat.get_connected_count()} peer(s)]: {message}")
                 else:
-                    print("[Waiting for connection...]")
+                    print("[Waiting for connections...]")
     finally:
         await chat.close()
         await session.close()
