@@ -1,195 +1,314 @@
+
 """
-Simple WebRTC Chat - Run two instances on the same laptop
+Simple WebRTC Chat with 6-Digit Code - Only 2 Terminals Needed!
 
 Installation:
-pip install aiortc
+pip install aiortc aiohttp
 
 Usage:
-Terminal 1: python chat.py --port 8000
-Terminal 2: python chat.py --port 8001
+Terminal 1: python chat.py --host
+Terminal 2: python chat.py --join
 
-Then follow the prompts to exchange offer/answer between terminals.
+The host creates a 6-digit code, the joiner enters it!
 """
 
 import asyncio
 import json
+import random
 import argparse
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
-from aiortc.contrib.signaling import object_from_string, object_to_string
+import aiohttp
+from aiohttp import web
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 
 
+# ============= SIGNALING SERVER (runs in host mode) =============
+class SignalingServer:
+    def __init__(self):
+        self.rooms = {}
+        self.app = web.Application()
+        self.app.router.add_get('/ws', self.websocket_handler)
+        self.runner = None
+    
+    async def start(self):
+        self.runner = web.AppRunner(self.app)
+        await self.runner.setup()
+        site = web.TCPSite(self.runner, '0.0.0.0', 8080)
+        await site.start()
+        
+        # Get local IP address
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(('8.8.8.8', 80))
+            local_ip = s.getsockname()[0]
+        except:
+            local_ip = '127.0.0.1'
+        finally:
+            s.close()
+        
+        print(f"[Server started on 0.0.0.0:8080]")
+        print(f"[Local IP: {local_ip}:8080]")
+    
+    async def stop(self):
+        if self.runner:
+            await self.runner.cleanup()
+    
+    async def websocket_handler(self, request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        room_code = None
+        
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                data = json.loads(msg.data)
+                
+                if data['type'] == 'join':
+                    room_code = data['code']
+                    if room_code not in self.rooms:
+                        self.rooms[room_code] = []
+                    self.rooms[room_code].append(ws)
+                    
+                    await ws.send_str(json.dumps({
+                        'type': 'joined',
+                        'code': room_code,
+                        'peers': len(self.rooms[room_code])
+                    }))
+                    
+                    for peer in self.rooms[room_code]:
+                        if peer != ws:
+                            await peer.send_str(json.dumps({'type': 'peer_joined'}))
+                
+                elif data['type'] in ['offer', 'answer', 'ice']:
+                    if room_code and room_code in self.rooms:
+                        for peer in self.rooms[room_code]:
+                            if peer != ws:
+                                await peer.send_str(msg.data)
+        
+        if room_code and room_code in self.rooms:
+            self.rooms[room_code].remove(ws)
+            if not self.rooms[room_code]:
+                del self.rooms[room_code]
+        
+        return ws
+
+
+# ============= WEBRTC CHAT CLIENT =============
 class WebRTCChat:
     def __init__(self):
         self.pc = RTCPeerConnection()
         self.channel = None
+        self.ws = None
+        self.is_initiator = False
+        self.connected = False
         
     def on_message(self, message):
-        """Called when a message is received"""
-        print(f"\n[Received]: {message}")
-        print("Enter message (or 'quit'): ", end='', flush=True)
+        print(f"\n[Peer]: {message}")
+        print(">> ", end='', flush=True)
+    
+    async def connect_signaling(self, room_code, server_url='http://localhost:8080'):
+        session = aiohttp.ClientSession()
+        self.ws = await session.ws_connect(f'{server_url}/ws')
+        
+        await self.ws.send_json({'type': 'join', 'code': room_code})
+        asyncio.create_task(self.handle_signaling())
+        
+        return session
+    
+    async def handle_signaling(self):
+        async for msg in self.ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                data = json.loads(msg.data)
+                
+                if data['type'] == 'joined':
+                    if data['peers'] == 1:
+                        print("[Waiting for peer...]")
+                        self.is_initiator = True
+                    else:
+                        print("[Peer found!]")
+                
+                elif data['type'] == 'peer_joined':
+                    if self.is_initiator:
+                        await self.create_offer()
+                
+                elif data['type'] == 'offer':
+                    await self.handle_offer(data['sdp'])
+                
+                elif data['type'] == 'answer':
+                    await self.handle_answer(data['sdp'])
+                
+                elif data['type'] == 'ice':
+                    if data['candidate']:
+                        candidate = RTCIceCandidate(
+                            sdpMid=data['candidate']['sdpMid'],
+                            sdpMLineIndex=data['candidate']['sdpMLineIndex'],
+                            candidate=data['candidate']['candidate']
+                        )
+                        await self.pc.addIceCandidate(candidate)
     
     async def create_offer(self):
-        """Create an offer (Peer 1)"""
-        # Create data channel
         self.channel = self.pc.createDataChannel("chat")
-        self.channel.on("message", self.on_message)
+        self.setup_channel()
         
-        # Create offer
-        await self.pc.setLocalDescription(await self.pc.createOffer())
+        @self.pc.on("icecandidate")
+        async def on_ice(event):
+            if event.candidate:
+                await self.ws.send_json({
+                    'type': 'ice',
+                    'candidate': {
+                        'candidate': event.candidate.candidate,
+                        'sdpMid': event.candidate.sdpMid,
+                        'sdpMLineIndex': event.candidate.sdpMLineIndex
+                    }
+                })
         
-        # Wait for ICE gathering
-        await self.wait_for_ice()
+        offer = await self.pc.createOffer()
+        await self.pc.setLocalDescription(offer)
         
-        return object_to_string(self.pc.localDescription)
+        await self.ws.send_json({
+            'type': 'offer',
+            'sdp': {'type': self.pc.localDescription.type, 'sdp': self.pc.localDescription.sdp}
+        })
     
-    async def create_answer(self, offer_str):
-        """Create an answer (Peer 2)"""
-        # Set up data channel handler
+    async def handle_offer(self, sdp):
         @self.pc.on("datachannel")
         def on_datachannel(channel):
             self.channel = channel
-            self.channel.on("message", self.on_message)
-            print("\n[Connected] Data channel established!")
-            print("Enter message (or 'quit'): ", end='', flush=True)
+            self.setup_channel()
         
-        # Set remote description
-        offer = object_from_string(offer_str)
-        await self.pc.setRemoteDescription(offer)
+        @self.pc.on("icecandidate")
+        async def on_ice(event):
+            if event.candidate:
+                await self.ws.send_json({
+                    'type': 'ice',
+                    'candidate': {
+                        'candidate': event.candidate.candidate,
+                        'sdpMid': event.candidate.sdpMid,
+                        'sdpMLineIndex': event.candidate.sdpMLineIndex
+                    }
+                })
         
-        # Create answer
-        await self.pc.setLocalDescription(await self.pc.createAnswer())
+        await self.pc.setRemoteDescription(RTCSessionDescription(sdp=sdp['sdp'], type=sdp['type']))
+        answer = await self.pc.createAnswer()
+        await self.pc.setLocalDescription(answer)
         
-        # Wait for ICE gathering
-        await self.wait_for_ice()
-        
-        return object_to_string(self.pc.localDescription)
+        await self.ws.send_json({
+            'type': 'answer',
+            'sdp': {'type': self.pc.localDescription.type, 'sdp': self.pc.localDescription.sdp}
+        })
     
-    async def set_answer(self, answer_str):
-        """Set the answer (Peer 1)"""
-        answer = object_from_string(answer_str)
-        await self.pc.setRemoteDescription(answer)
-        print("\n[Connected] Connection established!")
-        print("Enter message (or 'quit'): ", end='', flush=True)
+    async def handle_answer(self, sdp):
+        await self.pc.setRemoteDescription(RTCSessionDescription(sdp=sdp['sdp'], type=sdp['type']))
     
-    async def wait_for_ice(self):
-        """Wait for ICE gathering to complete"""
-        while self.pc.iceGatheringState != "complete":
-            await asyncio.sleep(0.1)
+    def setup_channel(self):
+        @self.channel.on("open")
+        def on_open():
+            self.connected = True
+            print("\n✓ Connected! You can now chat.\n")
+            print(">> ", end='', flush=True)
+        
+        @self.channel.on("message")
+        def on_message(message):
+            self.on_message(message)
     
     def send_message(self, message):
-        """Send a message through the data channel"""
         if self.channel and self.channel.readyState == "open":
             self.channel.send(message)
-            print(f"[Sent]: {message}")
             return True
-        else:
-            print("[Error] Channel not ready")
-            return False
+        return False
     
     async def close(self):
-        """Close the connection"""
+        if self.ws:
+            await self.ws.close()
         await self.pc.close()
 
 
-async def run_peer1():
-    """Run as Peer 1 (creates offer)"""
-    print("=== PEER 1 (Offer Creator) ===\n")
+# ============= MAIN APPLICATION =============
+async def run_host():
+    print("=== HOST MODE ===\n")
     
+    # Start signaling server
+    server = SignalingServer()
+    await server.start()
+    
+    # Generate room code
+    room_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+    print(f"\n★ Your Room Code: {room_code}")
+    print("★ Share this code with the other peer!\n")
+    
+    # Start chat client
     chat = WebRTCChat()
+    session = await chat.connect_signaling(room_code)
     
-    # Create offer
-    print("Creating offer...")
-    offer = await chat.create_offer()
-    
-    print("\n" + "="*50)
-    print("COPY THIS OFFER AND PASTE IN PEER 2:")
-    print("="*50)
-    print(offer)
-    print("="*50 + "\n")
-    
-    # Get answer
-    print("Waiting for answer from Peer 2...")
-    print("Paste the answer here (press Enter when done):\n")
-    
-    answer_lines = []
-    while True:
-        line = await asyncio.get_event_loop().run_in_executor(None, input)
-        if line.strip() == "":
-            break
-        answer_lines.append(line)
-    
-    answer = "\n".join(answer_lines)
-    await chat.set_answer(answer)
-    
-    # Chat loop
-    await chat_loop(chat)
-
-
-async def run_peer2():
-    """Run as Peer 2 (creates answer)"""
-    print("=== PEER 2 (Answer Creator) ===\n")
-    
-    chat = WebRTCChat()
-    
-    # Get offer
-    print("Paste the offer from Peer 1 (press Enter twice when done):\n")
-    
-    offer_lines = []
-    while True:
-        line = await asyncio.get_event_loop().run_in_executor(None, input)
-        if line.strip() == "":
-            break
-        offer_lines.append(line)
-    
-    offer = "\n".join(offer_lines)
-    
-    # Create answer
-    print("\nCreating answer...")
-    answer = await chat.create_answer(offer)
-    
-    print("\n" + "="*50)
-    print("COPY THIS ANSWER AND PASTE IN PEER 1:")
-    print("="*50)
-    print(answer)
-    print("="*50 + "\n")
-    
-    # Wait a bit for connection
     await asyncio.sleep(1)
     
-    # Chat loop
-    await chat_loop(chat)
+    try:
+        while True:
+            message = await asyncio.get_event_loop().run_in_executor(None, input, ">> ")
+            
+            if message.lower() == 'quit':
+                break
+            
+            if message.strip():
+                if chat.send_message(message):
+                    print(f"[You]: {message}")
+                else:
+                    print("[Waiting for connection...]")
+    finally:
+        await chat.close()
+        await session.close()
+        await server.stop()
 
 
-async def chat_loop(chat):
-    """Main chat loop"""
-    print("\nYou can now send messages. Type 'quit' to exit.\n")
+async def run_join():
+    print("=== JOIN MODE ===\n")
     
-    while True:
-        message = await asyncio.get_event_loop().run_in_executor(
-            None, input, "Enter message (or 'quit'): "
-        )
-        
-        if message.lower() == 'quit':
-            print("Closing connection...")
-            await chat.close()
-            break
-        
-        if message.strip():
-            chat.send_message(message)
+    server_ip = input("Enter host IP address (or press Enter for localhost): ").strip()
+    if not server_ip:
+        server_ip = "localhost"
+    
+    room_code = input("Enter 6-digit room code: ").strip()
+    
+    server_url = f"http://{server_ip}:8080"
+    print(f"\n[Connecting to {server_url}...]\n")
+    
+    chat = WebRTCChat()
+    session = await chat.connect_signaling(room_code, server_url)
+    
+    await asyncio.sleep(1)
+    
+    try:
+        while True:
+            message = await asyncio.get_event_loop().run_in_executor(None, input, ">> ")
+            
+            if message.lower() == 'quit':
+                break
+            
+            if message.strip():
+                if chat.send_message(message):
+                    print(f"[You]: {message}")
+                else:
+                    print("[Waiting for connection...]")
+    finally:
+        await chat.close()
+        await session.close()
 
 
 async def main():
-    parser = argparse.ArgumentParser(description='Simple WebRTC Chat')
-    parser.add_argument('--peer', choices=['1', '2'], required=True,
-                       help='Peer number (1 or 2)')
+    parser = argparse.ArgumentParser(description='WebRTC Chat with 6-Digit Code')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--host', action='store_true', help='Host mode (creates room)')
+    group.add_argument('--join', action='store_true', help='Join mode (joins room)')
     
     args = parser.parse_args()
     
-    if args.peer == '1':
-        await run_peer1()
+    if args.host:
+        await run_host()
     else:
-        await run_peer2()
+        await run_join()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nGoodbye!")
